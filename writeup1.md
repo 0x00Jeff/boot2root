@@ -469,7 +469,7 @@ Submit a project name to evaluate. One line per request.
 > uid=1002(wil) gid=1004(wil) groups=1004(wil),1001(evalops)
 ```
 
-- now we have a way to get to will as well (basically now the clear path is www-data -> wil -> ol)
+- now we have a way to get to will as well (basically now the clear path is www-data > wil -> ol)
 
 - I also found a script to decrypt a pdf under ~/ol's home the script says the keys are scattered over 4 places, and explains how to use them to decrypt that note
 ```
@@ -714,7 +714,7 @@ uid=1002(wil) gid=1004(wil) groups=1004(wil),1001(evalops)
 ```
 
 now it's the time to get `ol`
-I added a revshell to /home/old/scripts/check.sh and got the connection with penelope
+I added a revshell to /home/ol/scripts/check.sh and got the connection with penelope
 ```
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ol@hal9042:~$ ls
